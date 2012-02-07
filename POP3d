@@ -1,0 +1,429 @@
+#!/usr/bin/perl
+
+# $Id: POP3d,v 1.17 2008/08/26 09:29:17 fujiwara Exp $
+#
+# POP3d 
+#
+#    draft-ietf-eai-pop-03.txt
+#
+# Author: Kazunori Fujiwara
+# Contact: <fujiwara@jprs.co.jp>, <fujiwara@wide.ad.jp>
+#
+# Copyright and License are at the end of this file. 
+# Documentation is avaiable by "perldoc"
+
+require v5.8.8;
+my $progname_path = $0;
+
+BEGIN {
+    use lib '/home/eai/lib';
+};
+
+use Carp;
+use strict;
+use Socket;
+use Getopt::Std;
+use POSIX;
+use Sys::Syslog;
+use HTTPD::Authen;
+use UTF8SMTP::CONFIG;
+use UTF8SMTP::Downgrading;
+use UTF8SMTP::SMTP;
+
+my %option = (
+	MaildirPath => '.',
+	debug => 1,
+	Myname => "localhost",
+	RcptDomainname => 'localhost',
+	LogCategory => "daemon",
+	UserDBpath => "/dev/null",
+	Passwordfile => "/dev/null",
+	disableDowngrade => 0,
+);
+%option = parse_config_file($progname_path, '', %option);
+my %userdb = &read_userdb($option{UserDBpath}, $option{MaildirPath}, $option{IgnoreUserPath});
+&print_userdb (%userdb) if ($option{debug} > 2);
+if ($option{enable_stls}) {
+	use IO::Socket::SSL; # qw(debug4);
+}
+
+use constant  {
+    OK => "+OK",
+    ERR => "-ERR",
+    CRLF => "\r\n",
+    AUTHORIZATION => 1,
+    TRANSACTION => 2,
+    UPDATE => 3
+};
+
+my $src;
+
+sub main
+{
+    my $socket = getpeername STDIN;
+    my @list;
+    if (!defined($socket)) {
+		# debug;
+		$src = 'stdin [0.0.0.0]';
+    } else {
+		my ($port, $iaddr) = sockaddr_in($socket);
+		my $name = gethostbyaddr($iaddr, AF_INET);
+		my $ipaddr = inet_ntoa($iaddr);
+		$src = "$name [$ipaddr]";
+    }
+    $|=1;
+    logmsg ("request from $src");
+
+    my $in = *STDIN;
+    my $out = *STDOUT;
+    my $intls = 0;
+    my $utf8flag = 0;
+    my $user = '';
+    my $passwd = '';
+
+    print $out OK." POP3 server ready".CRLF;
+    my $state = AUTHORIZATION;
+    my @textpasswd = (DBType => 'Text', DB => $option{Passwordfile}, Server => 'apache');
+    my $authen = new HTTPD::Authen (@textpasswd);
+    if (!defined($authen)) {
+		&logmsg_die("HTTPD::Authen failed");
+    }
+
+    while($_ = &readline($in)) {
+		chomp;
+		chop if (/\r$/);
+		&logmsg("command: $_") if (!/^PASS/i);
+		my @args = split(' ');
+		my $cmd = shift(@args);
+		$cmd =~ tr /A-Z/a-z/;
+		if ($cmd eq 'capa') {
+	    	my @msg = (OK, 'USER', 'UIDL', 'UTF8');
+	    	push @msg, 'STLS' if ($option{enable_stls} && !$intls);
+	    	push @msg, '.';
+	    	&reply($out, @msg);
+		} elsif ($cmd eq 'utf8') {
+	    	if ($state == AUTHORIZATION) {
+				$utf8flag = 1;
+				&reply($out, OK);
+	    	} else {
+				&reply($out, ERR);
+	    	}
+		} elsif ($cmd eq 'stls' && $option{enable_stls} && !$intls) {
+	    	&reply($out, OK);
+	    	my $fd = IO::Socket::SSL->new_from_fd(fileno(STDIN),
+						  	SSL_server => 1,
+						  	Timeout => 120,
+						  	SSL_startHandshake => 1,
+						  	SSL_verify_mode => 0x00,
+						  	SSL_key_file => $option{ssl_key},
+						  	SSL_cert_file => $option{ssl_cert},
+						  	SSL_version => "SSLv23 TLSv1");
+	    	if ($fd) {
+				$in = $fd;
+				$out = $fd;
+				$intls = 1;
+	    	} else {
+				&logmsg("IO::Socket::SSL new_from_fd: ".IO::Socket::SSL::errstr());
+				&reply($out, ERR);
+				exit 0;
+	    	}
+		} elsif ($cmd eq 'user') {
+	    	if ($state == AUTHORIZATION) {
+				$user = shift(@args);
+				if ($user eq '' || $userdb{$user}->{path} eq '') {
+		    		&reply($out, ERR);
+		    		$user = '';
+				} else {
+		    		&reply($out, OK);
+				}
+	    	} else {
+				&reply($out, ERR);
+	    	}
+		} elsif ($cmd eq 'pass') {
+	    	if ($state == AUTHORIZATION) {
+				my $passwd = shift(@args);
+				if ($user ne '' && $passwd ne '' && $authen->check($user, $passwd)) {
+		    		$state = TRANSACTION;
+		    		last;
+				} else {
+		    		&reply($out, ERR);
+		    		$user = '';
+				}
+	    	} else {
+				&reply($out, ERR);
+	    	}
+		} elsif ($cmd eq 'quit') {
+	    	&reply($out, OK);
+	    	last;
+		} else {
+	    	&reply($out, ERR);
+		}
+    }
+    exit 0 if ($state ne TRANSACTION);
+    my $dir = $userdb{$user}->{path}.'/new/';
+    if (! -d $dir) {
+		&err_logmsg_die($out, "$dir not exist");
+    }
+    if ($userdb{$user}->{uid} ne '') {
+		if (POSIX::setuid($userdb{$user}->{uid}) < 0) {
+	    	&err_logmsg_die($out, 'setuid failed');
+		}
+    }
+    opendir (D, $dir)|| &err_logmsg_die($out, "opendir $!");
+    my @files = sort ( grep { /^[^.].*/ } (readdir(D)));
+    closedir D;
+
+    my @filesize;
+    my $total = 0;
+    for (my $i = 0; $i <= $#files; $i++) {
+		my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+	    	$atime,$mtime,$ctime,$blksize,$blocks)
+			= stat($dir.$files[$i]);
+		$filesize[$i] = $size;
+		$total += $size;
+    }
+    my $list = OK.' '.($#files+1).' messages ('.$total.' octets)';
+    &reply($out, $list);
+    while($_ = &readline($in)) {
+		chomp;
+		chop if (/\r$/);
+		&logmsg("command: $_");
+		my @args = split(' ');
+		my $cmd = shift(@args);
+		$cmd =~ tr /A-Z/a-z/;
+		if ($cmd eq 'noop') {
+	    	&reply($out, OK);
+		} elsif ($cmd eq 'stat') {
+	    	&reply($out, $list);
+		} elsif ($cmd eq 'list') {
+	    	my $num = shift @args;
+	    	my @msg;
+	    	if ($num eq '') {
+				push @msg, $list;
+				for (my $i = 0; $i <= $#files; $i++) {
+		    		if ($filesize[$i] > 0) {
+						push @msg, sprintf("%d %d", $i+1, $filesize[$i]);
+		    		}
+				}
+				push @msg, '.';
+	    	} elsif ($num < 1 || $num > $#files+1 || $filesize[$num-1] < 0) {
+				push @msg, ERR;
+	    	} else {
+				push @msg, printf(OK." %d %d", $num, $filesize[$num-1]);
+	    	}
+	    	&reply($out, @msg);
+		} elsif ($cmd eq 'uidl') {
+	    	my $num = shift @args;
+	    	my @msg;
+	    	if ($num eq '') {
+				push @msg, OK;
+				for (my $i = 0; $i <= $#files; $i++) {
+		   			if ($filesize[$i] > 0) {
+						push @msg, sprintf("%d %s", $i+1, $files[$i]);
+		   			}
+				}
+				push @msg, '.';
+	    	} elsif ($num < 1 || $num > $#files+1 || $filesize[$num-1] < 0) {
+				push @msg, ERR;
+	    	} else {
+				push @msg, sprintf(OK." %d %s", $num, $files[$num-1]);
+	    	}
+	    	&reply($out, @msg);
+		} elsif ($cmd eq 'retr') {
+	    	my $num = shift @args;
+	    	if ($num eq '' || $num < 1 || $num > $#files+1 || $filesize[$num-1] < 0) {
+				&reply($out, ERR);
+	    	} else {
+				my $f = $dir.$files[$num-1];
+				my $fh;
+				open($fh, $f) || &err_logmsg_die($out, "Cannot open ".$files[$num-1]);
+				my $msg = sprintf(OK." %d octets", $filesize[$num-1]);
+				&reply($out, $msg);
+				my $need = 0;
+				if (!$utf8flag && !$option{disableDowngrade}) {
+					my ($status, $body8bit) = &downgrading($fh, &downgrading_testonly);
+					$need = ($status == need_to_downgrade);
+					seek $fh, 0, 0;
+				}
+				if ($need) {
+					my ($status, $body8bit, $errorref, @body) = &downgrading($fh, &downgrading_7bit);
+					foreach my $m (@body) {
+						$m =~ tr /\r//d;
+						if ($m =~ /^\.\n/) { $m = '.'.$m; };
+						$m =~ s/\n\.\n/\n\.\.\n/g;
+						$m =~ s/\n/\r\n/g;
+						print $out $m;
+					}
+				} else {
+					while($_ = &readline($fh)) {
+		    			chomp;
+		    			if ($_ =~ /^\./) {
+			    			print $out '.'.$_.CRLF;
+		    			} else {
+			    			print $out $_.CRLF;
+		    			}
+					}
+				}
+				close($fh);
+				&reply($out, '.');
+	   		}
+		} elsif ($cmd eq 'dele') {
+	    	my $num = shift @args;
+	    	if ($num eq '' || $num < 1 || $num > $#files+1 || $filesize[$num-1] < 0) {
+				&reply($out, ERR);
+	    	} else {
+				$filesize[$num-1] = -$filesize[$num-1];
+				&reply($out, OK);
+	    	}
+		} elsif ($cmd eq 'rset') {
+	    	for (my $i = 0; $i <= $#filesize; $i++) {
+				if ($filesize[$i] < 0) {
+		    		$filesize[$i] = -$filesize[$i];
+				}
+	    	}
+	    	&reply($out, OK);
+		} elsif ($cmd eq 'quit') {
+	    	for (my $i = 0; $i <= $#filesize; $i++) {
+				if ($filesize[$i] < 0) {
+		    		unlink $dir.$files[$i];
+				}
+	    	}
+	    	&reply($out, OK);
+	    	last;
+		} else {
+	   		&reply($out, ERR);
+		}
+    }
+    exit 0;
+}
+
+sub reply
+{
+	my ($fd, @str) = @_;
+	my $str = join(CRLF, @str).CRLF;
+	print $fd $str;
+	&logmsg(join("\\r\\n", @str)) if ($option{debug} > 0);
+}
+
+sub err_logmsg_die
+{
+	my ($fd, @str) = @_;
+	my $str = join(CRLF, @str).CRLF;
+	print $fd $str;
+	&logmsg(join("\\r\\n", @str)) if ($option{debug} > 0);
+	exit 1;
+}
+
+&main;
+
+1;
+=head1 NAME
+
+POP3d - UTF8SMTP POP server daemon which supports downgrading
+
+=head1 DESCRIPTION
+
+POP3d is an implimentation of draft-ietf-eai-pop,
+draft-ietf-eai-utf8headers, draft-ietf-eai-downgrade.
+
+It does not support LANG capability, APOP, TOP commands.
+
+=head1 USAGE
+
+ POP3d is invoked by inetd.
+
+ POP3d handles mailboxes stored by SMTPreceiver.
+
+ POP3d shares user database with SMTPreceiver.
+ POP3d shares password database with Web mail (mail.cgi).
+
+=head2 mail.conf
+
+ Write a configuration file and put it to "/Path-To-/mail.conf".
+
+ It contains colon sparated field name and field value.
+ The field name field is composed of the field name and the program name. 
+ Two fields are separated by '@'.
+ Program name sub field may be omitted.
+ Don't include useless spaces or comments.
+ The line starts with '#' character is treated as comment line.
+
+ The configuration file is shared with SMTPreceiver, Submission,
+ POP3d, mail.cgi.
+
+                                              (default value)
+   MaildirPath:    Maildir base directory     (.)
+   UserDBpath:     User database path         (/dev/null)
+   LogCategory:    syslog category            (daemon)
+   Passwordfile:   Apache style passwd file   (/dev/null)
+   enable_stls:    Enable STLS                (0)
+   disableDowngarde: Disable Downgrading      (0)
+   ssl_cert:       TLS Certificate file       (none)
+   ssl_key:        TLS Private Key file       (none)
+
+ Example:
+	MaildirPath: /home/eai/maildirs
+	UserDBpath: /home/eai/bin/userdb
+        Passwordfile: /home/webmail/data/passwd
+	LogCategory: local0
+        enable_stls@POP3d: 1
+        ssl_cert@POP3d: /home/eai/bin/cert.pem
+        ssl_key@POP3d: /home/eai/bin/private.pem
+
+=head1 Bugs
+
+ This program may have many problems.
+ If you find any problem, please contact to the author.
+
+=head1 Author
+
+  Kazunori Fujiwara <fujiwara@jprs.co.jp> <fujiwara@wide.ad.jp>
+
+=head1 Copyright and License
+
+Copyright(c) 2007,2008 Japan Registry Services Co., Ltd.
+All rights reserved. By using this file, you agree to the
+terms and conditions set forth bellow.
+
+             LICENSE TERMS AND CONDITIONS 
+
+The following License Terms and Conditions apply, unless a different
+license is obtained from Japan Registry Service Co., Ltd. ("JPRS"),
+a Japanese corporation, Chiyoda First Bldg. East 13F,
+3-8-1 Nishi-Kanda, Chiyoda-ku, Tokyo 101-0065, Japan.
+
+1. Use, Modification and Redistribution (including distribution
+   of any modified or derived work) in source and/or binary forms
+   is permitted under this License Terms and Conditions.
+
+2. Redistribution of source code must retain the copyright notices
+   as they appear in each source code file, this License Terms and
+   Conditions.
+
+3. Redistribution in binary form must reproduce the Copyright
+   Notice, this License Terms and Conditions, in the documentation
+   and/or other materials provided with the distribution.
+   For the purposes of binary distribution the "Copyright Notice"
+   refers to the following language:
+   "Copyright(c) 2007,2008  Japan Registry Service Co., Ltd.
+    All rights reserved."
+
+4. The name of JPRS may not be used to endorse or promote products
+   derived from this Software without specific prior written
+   approval of JPRS.
+
+5. Disclaimer/Limitation of Liability: THIS SOFTWARE IS PROVIDED
+   BY JPRS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED.  IN NO EVENT SHALL JPRS BE LIABLE FOR ANY DIRECT,
+   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+   OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+   THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+   OF SUCH DAMAGES.
+
+=cut

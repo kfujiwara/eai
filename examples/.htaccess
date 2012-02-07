@@ -1,0 +1,11 @@
+<Files mail.cgi>
+require valid-user
+AuthUserFile /home/webmail/data/passwd
+AuthGroupFile /dev/null
+AuthName "Please enter username and password"
+AuthType Basic
+</Files>
+<Files .htaccess>
+Deny from All
+</Files>
+

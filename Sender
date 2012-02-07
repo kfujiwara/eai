@@ -1,0 +1,275 @@
+#!/usr/bin/perl
+
+# $Id: Sender,v 1.23 2008/07/01 08:47:20 fujiwara Exp $
+#
+# SMTPsender sends a SMTP/UTF8SMTP protocol message
+# to the specified server.
+#
+# Author: Kazunori Fujiwara
+# Contact: <fujiwara@jprs.co.jp>, <fujiwara@wide.ad.jp>
+#
+# Copyright and License are at the end of this file. 
+# Documentation is avaiable by "perldoc SMTPsender".
+
+require v5.8.8;
+BEGIN {
+    use lib '/home/eai/lib';
+};
+use strict;
+use Socket;
+use Getopt::Std;
+use UTF8SMTP::SMTP;
+use UTF8SMTP::Downgrading;
+use MIME::Base64;
+#
+#
+my $extension = "UTF8SMTP";
+my (%opts);
+
+sub report_response
+{
+	my (@r) = @_;
+	print "Returns: ",$#r, ":",join(" ", @r), "\n";
+	exit 1;
+}
+
+sub send_recv
+{
+	my ($socket, $data) = @_;
+
+	print $socket $data."\r\n";
+	print "send: $data\n";
+	my @r = &getsmtpresponse($socket);
+	print "recv: ".join(' ',@r), "\n";
+	return $r[0];
+}
+	
+sub send_data
+{
+	my $fh = shift;
+	my $me = '';
+	my $remote = '';
+	my $mailfrom;
+	my @recipient = ();
+	my $tls = 0;
+	my $smtpauth = '';
+	my $r;
+	my @r;
+
+	while($_ = <$fh>) {
+		chomp;
+		next if (/^#/ || /^$/);
+		if (/^AUTH\s+(\S+)\s+(\S+)\s+(\S+)\s*$/i) {
+			my ($method, $user, $passwd) = ($1, $2, $3);
+			$method =~ y/A-Z/a-z/;
+			if ($method ne 'plain') {
+				print "Unknown AUTH method $method\n";
+			} else {
+				$smtpauth = 'AUTH PLAIN '.MIME::Base64::base64_encode("$user\0$user\0$passwd");
+			}
+		} elsif (/^STARTTLS(|[ \t]+.*)$/i) {
+			$tls = 1;
+		} elsif (/^DATA(|[ \t]+.*)$/i) {
+			last;
+		} elsif (/^Mail[ \t]+from:[ \t]*([^ \t]+.*)$/i) {
+			$mailfrom = &parse_mailfrom($1);
+			if (!defined($mailfrom)) {
+			    print "Cannot parse: $_\n";
+			}
+		} elsif (/^Rcpt[ \t]+To:[ \t]*([^ \t]+.*)$/i) {
+			my $k = &parse_mailfrom($1);
+			if (defined($k)) {
+			    push @recipient, $k;
+			} else {
+			    print "Cannot parse: $_\n";
+			}
+		} elsif (/^myname:\s*(\S+)(|\s*.*)$/i) {
+		    $me = ' '.$1;
+		} elsif (/^connect:\s*(\S+)(|\s*.*)$/i) {
+		    $remote = $1;
+		} else {
+			print "UnknownCommand: $_\n";
+		} 
+	}
+	if ($remote eq "" || !defined($mailfrom) || $#recipient < 0) {
+		die "connect, Mail From, Rcpt To are not specified\n";
+	}
+	print "connect to $remote\n";
+	my $socket = &connectserver($remote);
+	my @r = &getsmtpresponse($socket);
+	print "recv: ".join(' ',@r), "\n";
+	if ($#r < 0 || $r[0] < 200 || $r[0] > 399) { &report_response(@r); }
+	$r = &send_recv($socket, "EHLO$me");
+	if ($tls) {
+		use IO::Socket::SSL;
+		$r = &send_recv($socket, "STARTTLS");
+		my $new = IO::Socket::SSL->new_from_fd($socket, SSL_use_cert => undef);
+		if (!$new) {
+		    die "IO::Socket::SSL : ".IO::Socket::SSL::errstr();
+		}
+		$socket = $new;
+		if ($opts{p}) {
+		    print $new->dump_peer_certificate;
+		    exit 1;
+		}
+		$r = &send_recv($socket, "EHLO$me");
+	}
+	if ($smtpauth ne '') {
+		$r = &send_recv($socket, $smtpauth);
+		if ($r < 200 || $r > 399) { exit 1; }
+	}
+	my ($e, $d) = &smtp_envelope_generate("MAIL FROM", $mailfrom, 0);
+	$r = &send_recv($socket, $e);
+	if ($r < 200 || $r > 399) { exit 1; }
+	foreach my $k (@recipient) {
+	    my ($e, $d) = &smtp_envelope_generate("RCPT TO", $k, 0);
+	    $r = &send_recv($socket, $e);
+	    if ($r < 200 || $r > 399) { exit 1; }
+	}
+	$r = &send_recv($socket, "DATA");
+	if ($r < 200 || $r > 399) { exit 1; }
+	while($_ = <$fh>) {
+	    $_ = "..\n" if ($_ eq ".\n");
+	    s/\n/\r\n/g;
+	    print $socket $_;
+	}
+	$r = &send_recv($socket, ".");
+	if ($r < 200 || $r > 399) { exit 1; }
+	$r = &send_recv($socket, "QUIT");
+	if ($r < 200 || $r > 399) { exit 1; }
+	my $a = close($socket);
+	print "close returns $a\n";
+}
+
+sub connectserver
+{
+	my($host,$port) = @_;
+	my $socket;
+	my @host = split(/:/, $host);
+	$host = $host[0];
+	$port = $host[1] if ($host[1] ne '');
+	$port = 587 if ($port eq '');
+	my $ipaddr = inet_aton($host) || die "hostname $host not resolved: $!";
+	my $proto = getprotobyname('tcp');
+	socket($socket, PF_INET, SOCK_STREAM, $proto) || die "socket: $!";
+	my $sin = sockaddr_in($port,$ipaddr);
+	connect($socket,$sin) || die "connect:$!";
+	select($socket);
+	$| = 1;
+	select(STDOUT);
+	return $socket;
+}
+
+if ($#ARGV < 0) {
+	print "Sender filename filename ...
+
+Format:
+	connect: server_address:port
+	myname: my_ehlo_name
+	STARTTLS
+	AUTH PLAIN user passwd
+	MAIL FROM: ...
+	RCPT TO: ...
+	RCPT TO: ...
+	DATA
+	Email header fields
+	
+	Email Body
+";
+	exit 1;
+}
+getopts('p', \%opts);
+&main;
+
+sub main
+{
+    foreach my $l (@ARGV) {
+	my $fh;
+	open($fh, $l) || die "cannot open $l";
+	&send_data($fh);
+	close($fh);
+    }
+}
+
+1;
+__END__
+
+=head1 NAME
+
+SMTPsender - SMTP/UTF8SMTP sender
+
+=head1 DESCRIPTION
+
+ SMTPsender is a Email client which sends any SMTP messages
+ to the specified SMTP server.
+ It ignores any ESMTP options.
+
+=head1 USAGE
+
+ SMTPsender filename filename ...
+
+Format:
+    # Comments
+    connect: server_address:port
+    myname: EHLO hostname
+    STARTTLS
+    AUTH PLAIN user passwd
+    MAIL FROM: ...
+    RCPT TO: ...
+    RCPT TO: ...
+    DATA
+    Email header fields
+    
+    Email message body
+
+=head1 Bugs
+
+ This program does not handle any errors.
+
+=head1 Author
+
+  Kazunori Fujiwara <fujiwara@jprs.co.jp> <fujiwara@wide.ad.jp>
+
+=head1 Copyright and License
+
+Copyright(c) 2007,2008  Japan Registry Services Co., Ltd.  All rights reserved.
+ 
+By using this file, you agree to the terms and conditions set forth bellow.
+
+			LICENSE TERMS AND CONDITIONS 
+
+The following License Terms and Conditions apply, unless a different
+license is obtained from Japan Registry Service Co., Ltd. ("JPRS"),
+a Japanese corporation,  Chiyoda First Bldg. East 13F, 3-8-1 Nishi-Kanda,
+Chiyoda-ku, Tokyo 101-0065, Japan.
+
+1. Use, Modification and Redistribution (including distribution of any
+   modified or derived work) in source and/or binary forms is permitted
+   under this License Terms and Conditions.
+
+2. Redistribution of source code must retain the copyright notices as they
+   appear in each source code file, this License Terms and Conditions.
+
+3. Redistribution in binary form must reproduce the Copyright Notice,
+   this License Terms and Conditions, in the documentation and/or other
+   materials provided with the distribution.  For the purposes of binary
+   distribution the "Copyright Notice" refers to the following language:
+   "Copyright(c) 2007,2008  Japan Registry Service Co., Ltd.  All rights reserved."
+
+4. The name of JPRS may not be used to endorse or promote products
+   derived from this Software without specific prior written approval of
+   JPRS.
+
+5. Disclaimer/Limitation of Liability: THIS SOFTWARE IS PROVIDED BY JPRS
+   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+   PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL JPRS BE LIABLE
+   FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+   BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+   OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+   ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+=cut

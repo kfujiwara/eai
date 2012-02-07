@@ -1,0 +1,68 @@
+How to install UTF8SMTP/EAI prototype.
+					Kazunori Fujiwara, JPRS
+					March 14, 2008
+
+# Read README.txt before installing.
+
+0. Before installing, install perl modules from CPAN.
+	Net::LibIDN	      for Submission
+	Net::DNS	      for Submission
+	HTTPD::UserAdmin      for webmail, POP3 and Submission
+	IO::Socket::SSL	      for Submission, SMTPreceiver
+	TimeDate (Date::Parse) for mail.cgi
+
+
+1. Prepare user 'eai' and group 'eai'.
+   Home directory of the user 'eai' is "/home/eai".
+
+2. Do 'make makedir' with superuser privilege.
+   Do 'make install' with suitable privilege.
+
+3. edit /etc/inetd.conf and start inetd.
+
+  smtp	stream	tcp	nowait	root	/home/eai/bin/SMTPreceiver
+  submission stream	tcp	nowait	eai	/home/eai/bin/Submission
+  pop3 stream	tcp	nowait	root	/home/eai/bin/POP3d
+
+4. write /home/eai/bin/mail.conf,
+   /home/webmail/data/userdb and /home/webmail/data/passwd.
+   Examples are in examples directory.
+
+5. Causion: Submission may become SPAM open relay.
+   Limit access to Submission port using tcp wrappers or SMTP AUTH.
+
+6. Causion: SMTPreceiver runs with superuser privilege.
+   If possible, you SHOULD run this program under restricted environment.
+
+7. webmail client installation procedures are in mail.cgi. Try perldoc mail.cgi
+
+Directory structure:
+
+/home/eai/bin:
+	Submission		Submission program invoked by inetd.
+	SMTPreceiver		SMTP server program invoked by inetd.
+	POP3d			POP3 server invoked by inetd.
+	Downgrade		Downgrade program (See perldoc Downgrade)
+	Sender			Sender program (See perldoc Sender)
+	mail.conf		Shared configuration file
+				 read perldoc of SMTPreceiver, Submission,
+						 POP3d, mail.cgi.
+				Shared user database file
+
+/home/eai/tmp:			Submission temporary file directory
+/home/eai/maildirs:		Maildir base directory
+/home/eai/maildirs/USERNAME/	Maildir user directory
+/home/eai/lib/UTF8SMTP:		Perl module directory
+	SMTP.pm
+	MIME.pm
+	Downgrading.pm
+	CONFIG.pm
+
+/home/webmail/www:		Webmail www directory
+	index.html
+	mail.cgi		  See perldoc mail.cgi
+	admin.cgi
+	.htaccess
+/home/webmail/data:		Webmail data directory
+	userdb			 manual is included in "perldoc SMTPreceiver".
+	passwd			 Shared password file (Web, POP3d, SMTPAUTH)

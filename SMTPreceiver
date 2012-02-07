@@ -1,0 +1,427 @@
+#!/usr/bin/perl
+# $Id: SMTPreceiver,v 1.65 2008/07/28 09:27:45 fujiwara Exp $
+#
+# SMTPreceiver receives UTF8SMTP protocol messages
+# and stores them as Maildir format.
+#
+#    draft-ietf-eai-smtp-11.txt
+#    draft-ietf-eai-utf8headers-09.txt
+#
+# Author: Kazunori Fujiwara
+# Contact: <fujiwara@jprs.co.jp>, <fujiwara@wide.ad.jp>
+#
+# Copyright and License are at the end of this file. 
+# Documentation is avaiable by "perldoc"
+
+require v5.8.8;
+my $progname_path = $0;
+
+BEGIN {
+    use lib '/home/eai/lib';
+};
+
+use Carp;
+use strict;
+use Socket;
+use POSIX;
+use Sys::Syslog;
+use UTF8SMTP::CONFIG;
+use UTF8SMTP::MIME;
+use UTF8SMTP::SMTP;
+
+my %option = (
+	MaildirPath => '/tmp',
+	debug => 1,
+	enable_eai => 0,
+	enable_8bit => 0,
+	enable_startssl => 0,
+	Myname => "localhost",
+	RcptDomainname => 'localhost',
+	LogCategory => "daemon",
+	UserDBpath => "/dev/null",
+	IgnoreUserPath => 1,
+);
+if (!defined(%option = parse_config_file($progname_path, '', %option))) {
+    exit 1;
+}
+if ($option{enable_starttls}) {
+	use IO::Socket::SSL; # qw(debug4);
+}
+
+my %userdb = &read_userdb($option{UserDBpath}, $option{MaildirPath}, $option{IgnoreUserPath});
+my %RcptDomainname;
+foreach my $t (split(/,/, $option{RcptDomainname})) {
+	$t =~ tr/A-Z/a-z/;
+	$RcptDomainname{$t} = 1;
+};
+&print_userdb(%userdb) if ($option{debug} > 1);
+&set_datetime_tz($option{TimeZone}, $option{TimeZoneOffset});
+
+my (@recipient);
+my ($mailfrom);
+
+sub clearvariable
+{
+	@recipient = ();
+	undef $mailfrom;
+}
+sub closeall
+{
+	my $fh;
+	foreach my $k (@recipient) {
+		my $fh = $k->{fh};
+		close ($fh);
+	}
+}
+
+my $src = &getconnectfrom();
+my $srchost = '';
+my $intls = 0;
+$|=1;
+my $count = 0;
+&logmsg ("request from $src") if ($option{debug});
+
+my $in = *STDIN;
+my $out = *STDOUT;
+my $reply;
+&reply($out,"220 $option{Myname} ESMTP");
+	while($_ = &readline($in)) {
+		chomp;
+		chop if (/\r$/);
+		&logmsg("command: $_") if ($option{debug});
+		if (/^helo$/i || /^helo\s+(\S+)$/i) {
+			&reply($out, '250 '.$option{Myname});
+			$srchost = $1;
+		} elsif (/^ehlo$/i || /^ehlo\s+(\S+)$/i) {
+			$srchost = $1;
+			my @data;
+			push @data, "250-$option{Myname}";
+			push @data, "250-UTF8SMTP" if ($option{enable_eai});
+			push @data, "250-8BITMIME" if ($option{enable_8bit});
+			push @data, "250-STARTTLS" if ($option{enable_starttls} && $intls == 0);
+			push @data, "250 HELP";
+			&reply($out,@data);
+		} elsif (/^mail\s+from:\s*(\S+.*)\s*$/i) {
+			if (!defined($mailfrom)) {
+				$mailfrom = &parse_mailfrom($1);
+				@recipient = ();
+				if (defined($mailfrom)) {
+					$reply = "250 ok";
+				} else {
+					$reply = "501 syntax error";
+				}
+			} else {
+				$reply = "501 duplicate mail from";
+			}
+			&reply($out, $reply);
+		} elsif (/^rcpt\s+to:\s*(\S+.*)\s*$/i) {
+			if (defined($mailfrom)) {
+				my $k = &parse_mailfrom($1);
+				if ($k eq "") {
+					$reply = "501 syntax error";
+				} else {
+					my ($user, $error) = &check_recipient($k->{addr});
+					if ($user eq "") {
+						$reply = $error;
+					} else {
+						my ($handle, $filename) = &open_maildir($user);
+						if ($handle eq "") {
+							$reply = "550 Mailbox $user is unavailable";
+						} else {
+							$k->{user} = $user;
+							$k->{fh} = $handle;
+							$k->{filename} = $filename;
+							push @recipient, $k;
+							&logmsg("FROM $src MAILFROM ".&generate_mailbox($mailfrom)." RCPTTO ".&generate_mailbox($k)." USER \"$user\" FILE $filename");
+							$reply = "250 ok";
+						}
+					}
+				}
+			} else {
+				$reply = "501 MAIL FROM REQUIRED";
+			}
+			&reply($out, $reply);
+		} elsif ($#recipient >= 0 && /^data$/i) {
+			&reply($out, "354 go ahead");
+			my $now_string = &datetime_string(time);
+			for my $k (@recipient) {
+				my $fh = $k->{fh};
+				print $fh &folding("Return-Path: ".&generate_mailbox($mailfrom))."\n"
+				. &folding("Delivered-To: ".&generate_mailbox($k))."\n"
+				. &folding("Received: from ".(($srchost eq '')?"unknown":$srchost)." ($src) by ".$option{Myname}.
+				" for ".&generate_mailbox($k)."; $now_string")."\n";
+			}
+			while($_ = &readline($in)) {
+				chomp;
+				chop if (/\r$/);
+				&logmsg("read: $_") if ($option{debug});
+				last if ($_ eq ".");
+				$_ =~ s/^\.//;
+				for my $k (@recipient) {
+					my $fh = $k->{fh};
+					print $fh $_."\n";
+				}
+			}
+			last if ($_ ne ".");
+			&reply($out, "250 ok");
+			&closeall;
+			for my $k (@recipient) {
+				my $f = $k->{filename};
+				my $u = $k->{user};
+				my $d = $userdb{$u}->{path};
+				rename "$d/tmp/$f", "$d/new/$f";
+			}
+			&clearvariable;
+		} elsif (/^rset/i) {
+			&closeall;
+			&clearvariable;
+			$mailfrom = undef;
+			&reply($out, "250 ok");
+		} elsif (/^noop$/i) {
+			&reply($out, "250 ok");
+		} elsif (/^help$/i) {
+			&reply($out, "214 JPRS eai prototype page: http://eai.dnslab.jp/");
+		} elsif (/^quit/i) {
+			&reply($out, "221 $option{Myname}");
+			&closeall;
+			if ($intls) {
+				my $ret = $in->close(SSL_no_shutdown => 1);
+			}
+			exit 0;
+		} elsif (/^STARTTLS$/i && $option{enable_starttls}) {
+			&reply($out, "220 Go ahead");
+			my $fd = IO::Socket::SSL->new_from_fd(fileno(STDIN),
+				SSL_server => 1,
+				Timeout => 120,
+				SSL_startHandshake => 1,
+				SSL_verify_mode => 0x00,
+				SSL_key_file => $option{ssl_key},
+				SSL_cert_file => $option{ssl_cert},
+				SSL_version => "SSLv23 TLSv1");
+			if ($fd) {
+				$in = $fd;
+				$out = $fd;
+				$intls = 1;
+				$src .= ' /TLS';
+				#&logmsg($fd->dump_peer_certificate);
+			} else {
+				&logmsg("IO::Socket::SSL new_from_fd: ".IO::Socket::SSL::errstr());
+				&reply($out, "454 TLS not available due to temporary reason");
+				exit 0;
+			}
+		} else {
+			&reply($out, "501 syntax error: $_");
+		}
+	}
+	&logmsg("closed by client: $src") if ($option{debug});
+	exit 0;
+
+sub reply
+{
+	my ($fd, @str) = @_;
+	my $crlf = "\r\n";
+	my $str = join($crlf, @str).$crlf;
+	print $out $str;
+	&logmsg(join("\\r\\n", @str)) if ($option{debug} > 0);
+}
+
+sub check_recipient
+{
+	my ($addr) = @_;
+	my ($user, $host, @rest) = split(/\@/, $addr);
+	$host =~ tr/A-Z/a-z/;
+	return ("", "553 Address Syntax Error") if ($user eq "" || $host eq "" || $#rest >= 0);
+	return ("", "550 Relaying denied.") if (!defined($RcptDomainname{$host}));
+	if (!defined($userdb{$user})) {
+		if (defined($userdb{''})) {
+			my $default = $userdb{''}->{alias};
+			&logmsg("Unknown user $user is aliased to default $default");
+			$user = $default;
+		} else {
+			return ("", "550 User unknown");
+		}
+	} elsif ($userdb{$user}->{user} eq '') {
+	    $user = $userdb{$user}->{alias};
+	}
+	my $userpath = $userdb{$user}->{path};
+	if (!defined($userpath)) {
+		&logmsg("550 No mailbox : user=$user");
+		return ("", "550 No mailbox");
+	}
+	return ($user, "");
+}
+
+sub open_maildir
+{
+	my ($user) = @_;
+	my ($handle, $path);
+
+	my $filename = sprintf("%d.%d%03d.%s", time, $$, $count++, $option{Myname});
+	my $userpath = $userdb{$user}->{path};
+	my $useruid = $userdb{$user}->{uid};
+	if (!-d $userpath) {
+		&logmsg("creating $userpath with $useruid");
+		mkdir $userpath, 0700;
+		mkdir "$userpath/new", 0700;
+		mkdir "$userpath/tmp", 0700;
+		mkdir "$userpath/cur", 0700;
+		if (defined($useruid)) {
+			 chown $useruid, -1, $userpath, "$userpath/new", "$userpath/tmp", "$userpath/cur";
+		}
+	}
+	$path = $userpath.'/tmp/'.$filename;
+	if (-f $path) {
+	    sleep 2;
+	    $filename = sprintf("%d.%d%03d.%s", time, $$, $count++, $option{Myname});
+	}
+	return ("","") if (-f $path);
+	return ("","") if (!open $handle, ">$path");
+	if (defined($useruid)) {
+		chown $useruid, -1, $path;
+	}
+	return ($handle, $filename);
+}
+
+###############################################################################
+1;
+__END__
+
+=head1 NAME
+
+SMTPreceiver - UTF8SMTP Mail Delivery Agent
+
+=head1 DESCRIPTION
+
+ SMTPreceiver is a Mail Delivery Agent which supports
+ Email Address Internationalization (UTF8SMTP) extension.
+ It is invoked by inetd superserver.
+ It stores Email messages into file system as a maildir format.
+
+=head1 USAGE
+
+ Put "smtp stream tcp nowait root /Path-To-/SMTPreceiver" line
+ to /etc/inetd.conf.
+
+=head2 mail.conf
+
+ Write a configuration file and put it to "/Path-To-/mail.conf".
+
+ It contains colon sparated field name and field value.
+ The field name field is composed of the field name and the program name. 
+ Two fields are separated by '@'.
+ Program name sub field may be omitted.
+ Don't include useless spaces or comments.
+ The line starts with '#' character is treated as comment line.
+
+ The configuration file is shared with SMTPreceiver, Submission,
+ POP3d, mail.cgi.
+
+ Name field may contain 
+
+   (Name)          (Value)                    (default value)
+   MaildirPath:    Maildir base directory     (.)
+   RcptDomainname: Recipient domain name      (localhost)
+   UserDBpath:     User database path         (/dev/null)
+   Myname:          EHLO name                 (localhost)
+   LogCategory:     syslog category           (daemon)
+   enable_eai:     responds UTF8SMTP or not   (0)
+   enable_8bit:    responds 8BITMIME or not   (0)
+   enable_startssl: Enable STARTSSL           (0)
+   TimeZone:       Timezone used in Received  ()
+   TimeZoneOffset: Timezone offset            (0)
+   ssl_cert:       TLS Certificate file       (none)
+   ssl_key:        TLS Private Key file       (none)
+
+ Example:
+	MaildirPath: /home/eai/maildirs
+	RcptDomainname@SMTPreceiver: eai.dnslab.jp,XN--WGV71A119E.JP,non-ASCII.TLD
+	UserDBpath: /home/eai/bin/userdb
+	Myname@SMTPreceiver: eai.dnslab.jp
+	LogCategory: local0
+        enable_eai:  1
+        enable_8bit: 1
+        TimeZone: +0900
+        TimeZoneOffset: 32400
+        ssl_cert: /home/eai/bin/cert.pem
+        ssl_key: /home/eai/bin/private.pem
+
+=head2 userdb
+
+ User Database file format:
+	R:username:password:UID:Maildir_path
+	A:name:username
+
+ Collon separated text database.
+ First parameter is an attribute of the line. One ASCII character.
+  R: the line shows one user account.
+     Second field is the username. the username must be ASCII only.
+     Third firld is not used now.
+     The forth field is UID of the user's Maildir.
+     The fifth field is Maildir_path. Absolute and relative path is allowed.
+
+  A: The line shows the alias for the addr.
+     The name is the name to alias,
+     and the username is the alias for that name.
+     The name's encoding must be UTF-8
+     and the name may contain non-ASCII characters.
+     The username must be ASCII only.
+     The username must be defined in this database
+     as a user acoount.
+
+=head1 Bugs
+
+ This program does not consider any security issues.
+ Be careful if you use this program.
+
+=head1 Author
+
+  Kazunori Fujiwara <fujiwara@jprs.co.jp> <fujiwara@wide.ad.jp>
+
+=head1 Copyright and License
+
+Copyright(c) 2007,2008 Japan Registry Services Co., Ltd.
+All rights reserved. By using this file, you agree to the
+terms and conditions set forth bellow.
+
+             LICENSE TERMS AND CONDITIONS 
+
+The following License Terms and Conditions apply, unless a different
+license is obtained from Japan Registry Service Co., Ltd. ("JPRS"),
+a Japanese corporation, Chiyoda First Bldg. East 13F,
+3-8-1 Nishi-Kanda, Chiyoda-ku, Tokyo 101-0065, Japan.
+
+1. Use, Modification and Redistribution (including distribution
+   of any modified or derived work) in source and/or binary forms
+   is permitted under this License Terms and Conditions.
+
+2. Redistribution of source code must retain the copyright notices
+   as they appear in each source code file, this License Terms and
+   Conditions.
+
+3. Redistribution in binary form must reproduce the Copyright
+   Notice, this License Terms and Conditions, in the documentation
+   and/or other materials provided with the distribution.
+   For the purposes of binary distribution the "Copyright Notice"
+   refers to the following language:
+   "Copyright(c) 2007,2008  Japan Registry Service Co., Ltd.
+    All rights reserved."
+
+4. The name of JPRS may not be used to endorse or promote products
+   derived from this Software without specific prior written
+   approval of JPRS.
+
+5. Disclaimer/Limitation of Liability: THIS SOFTWARE IS PROVIDED
+   BY JPRS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED.  IN NO EVENT SHALL JPRS BE LIABLE FOR ANY DIRECT,
+   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+   OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+   THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+   OF SUCH DAMAGES.
+
+=cut

@@ -1,0 +1,380 @@
+#!/usr/bin/perl
+
+#  $Id: Submission,v 1.42 2008/07/28 15:31:27 fujiwara Exp $
+#
+#  Submission: UTF8SMTP Submission daemon which supports downgrading.
+#
+#    draft-ietf-eai-smtp-11.txt
+#    draft-ietf-eai-utf8headers-09.txt
+#    draft-ietf-eai-downgrade-06.txt
+#
+# Author: Kazunori Fujiwara
+# Contact: <fujiwara@jprs.co.jp>, <fujiwara@wide.ad.jp>
+#
+# Copyright and License are at the end of this file. 
+# Documentation is avaiable by "perldoc"
+
+require v5.8.8;
+my $progname_path = $0;
+
+BEGIN {
+	use lib '/home/eai/lib';
+};
+
+use Carp;
+use strict;
+use Socket;
+use Getopt::Std;
+use UTF8SMTP::CONFIG;
+use UTF8SMTP::MIME;
+use UTF8SMTP::SMTP;
+use UTF8SMTP::Downgrading;
+
+my %option = (
+		enable_eai => 0,
+		enable_8bit => 0,
+		enable_smtpauth => 0,
+		enable_startssl => 0,
+		debug => 0,
+		Myname => "localhost",
+		MyAuthDomain => "localhost",
+		LogCategory => "daemon",
+		workdir => "/tmp/",
+);
+if (!defined(%option = parse_config_file($progname_path, '', %option))) {
+	exit 1;
+}
+&set_datetime_tz($option{TimeZone}, $option{TimeZoneOffset});
+
+if ($option{enable_starttls}) {
+	use IO::Socket::SSL; # qw(debug4);
+}
+
+if (defined($ENV{RELAYCLIENT})) {
+	$option{enable_smtpauth} = 0;
+}
+my $authen;
+if ($option{enable_smtpauth}) {
+	use HTTPD::Authen;
+	use MIME::Base64;
+	my @textpasswd = (DBType => 'Text', DB => $option{Passwordfile}, Server => 'apache');
+	$authen = new HTTPD::Authen (@textpasswd);
+}
+my (@recipient);
+my ($mailfrom);
+
+my $socket = getpeername STDIN;
+my $src;
+my $filename;
+my $srchost;
+
+if (!defined($socket)) {
+	# debug;
+	$src = 'stdin [0.0.0.0]';
+} else {
+	my ($port, $iaddr) = sockaddr_in($socket);
+	my $name = gethostbyaddr($iaddr, AF_INET);
+	my $ipaddr = inet_ntoa($iaddr);
+	$src = "$name [$ipaddr]";
+}
+
+	$|=1;
+	&logmsg("request from $src");
+
+my $intls = 0;
+my $in = *STDIN;
+my $out = *STDOUT;
+my $authenticated = '';
+my $reply;
+
+&reply($out,"220 $option{Myname} ESMTP");
+	while($_ = &readline($in)) {
+		chomp;
+		chop if (/\r$/);
+		&logmsg("command: $_") if (!/^AUTH/i);
+		if (/^helo$/i || /^helo\s+(\S+)$/i) {
+			&reply($out, '250 '.$option{Myname});
+			$srchost = $1;
+		} elsif (/^ehlo$/i || /^ehlo\s+(\S+)$/i) {
+			$srchost = $1;
+			my @data;
+			push @data, "250-$option{Myname}";
+			push @data, "250-UTF8SMTP" if ($option{enable_eai});
+			push @data, "250-8BITMIME" if ($option{enable_8bit});
+			push @data, "250-STARTTLS" if ($option{enable_starttls} && $intls == 0);
+			push @data, "250-AUTH PLAIN" if ($option{enable_smtpauth});
+			push @data, "250 HELP";
+			&reply($out,@data);
+		} elsif (/^auth(|\s.*)$/i && $option{enable_smtpauth}) {
+			my $param = $1;
+			my $method = '';
+			if ($param =~ /^\s*(\S+)(|\s+(\S.*))$/) {
+				$method = $1;
+				$method =~ y/A-Z/a-z/;
+				$param = $3;
+			}
+			if ($method eq 'plain') {
+				if ($param eq '') {
+					&reply($out, "334");
+					last if (!($param = &readline($in)));
+				}
+				if ($authenticated = &smtpauth_check($param)) {
+					&reply($out, "235 Authentication succeed as $authenticated");
+					&logmsg("Authenticated as $authenticated");
+				} else {
+						&reply($out, "535 Authentication failed");
+					&logmsg("Authentication failed");
+				}
+			} else {
+				&reply($out, "504 Unsupported authentication mechanism");
+			}
+		} elsif (/^mail\s+from:\s*(\S+.*)\s*$/i) {
+			if ($option{enable_smtpauth} && $authenticated eq '') {
+				&reply($out, "530 Authentication required");
+				next;
+			}
+			if (!defined($mailfrom)) {
+				$mailfrom = &parse_mailfrom($1);
+				if ($authenticated ne '') {
+					my @param = $mailfrom->{param};
+					for (my $i = 0; $i <= $#param; $i++) {
+						if ($param[$i] =~ /^AUTH=/i) {
+							$param[$i] = '';
+						}
+					}
+				}
+				@recipient = ();
+				if (defined($mailfrom)) {
+					&reply($out, "250 ok");
+				} else {
+					&reply($out, "501 syntax error");
+					$mailfrom = undef;
+				}
+			} else {
+				&reply($out, "501 duplicate mail from");
+			}
+		} elsif (/^rcpt\s+to:\s*(\S+.*)\s*$/i) {
+			if (defined($mailfrom)) {
+				my $rcptto = &parse_mailfrom($1);
+				if (!defined($rcptto)) {
+					&reply($out ,"501 syntax error");
+				} else {
+					push @recipient, $rcptto;
+					&reply($out, "250 ok");
+				}
+			} else {
+				&reply($out, "501 MAIL FROM REQUIRED");
+			}
+		} elsif ($#recipient >= 0 && /^data$/i) {
+			&reply($out, "354 go ahead");
+			$filename = $option{workdir}.sprintf('/incoming-%d.%d', time. $$);
+			open(W, ">$filename") || logmsg_die "cannot write $filename";
+			while($_ = &readline($in)) {
+				chomp;
+				chop if (/\r$/);
+				last if ($_ eq ".");
+				print W $_, "\n";
+			}
+			close(W);
+			&logmsg_die("disconnected from client") if ($_ ne ".");
+			my $smtpfrom = "$srchost (".$src.($authenticated ne ''? " smtpauth=$authenticated":"").")";
+			my @error = &send_messages($filename, $option{Myname}, $smtpfrom, $mailfrom, @recipient);
+			unlink($filename);
+			my @msg;
+			if ($#error < 0) {
+				push @msg, "250 ok";
+			} else {
+				foreach my $l (@error) {
+					push @msg, "554-".$l;
+					logmsg($l);
+				}
+				push @msg, "554 Transaction failed";
+			}
+			$mailfrom = undef;
+			&reply($out, @msg);
+		} elsif (/^rset/i) {
+			@recipient = ();
+			$mailfrom = undef;
+			&reply($out, "250 ok");
+		} elsif (/^noop$/i) {
+			&reply($out, "250 ok");
+		} elsif (/^help$/i) {
+			&reply($out, "214 JPRS eai prototype page: http://eai.dnslab.jp/");
+		} elsif (/^quit/i) {
+			&reply($out, "221 $option{Myname}");
+			exit 0;
+		} elsif (/^STARTTLS$/i && $option{enable_starttls}) {
+			&reply($out,"220 Go ahead");
+			my $fd = IO::Socket::SSL->new_from_fd(fileno(STDIN),
+				SSL_server => 1,
+				Timeout => 120,
+				SSL_startHandshake => 1,
+				SSL_verify_mode => 0x00,
+				SSL_key_file => $option{ssl_key},
+				SSL_cert_file => $option{ssl_cert},
+				SSL_version => "SSLv23 TLSv1");
+			if ($fd) {
+				$in = $fd;
+				$out = $fd;
+				$intls = 1;
+				$src .= ' /TLS';
+			} else {
+				&logmsg("IO::Socket::SSL new_from_fd: ".IO::Socket::SSL::errstr());
+				&reply($out, "454 TLS not available due to temporary reason");
+				exit 0;
+			}
+		} else {
+			&reply($out, "501 syntax error: $_");
+		}
+	}
+	&logmsg("closed by client: $src");
+	exit 0;
+
+sub reply
+{
+	my ($fd, @str) = @_;
+	my $crlf = "\r\n";
+	my $str = join($crlf, @str).$crlf;
+	print $out $str;
+	&logmsg(join("\\r\\n", @str)) if ($option{debug} > 0);
+}
+
+sub smtpauth_check
+{
+	my $param = shift;
+	my $fail = '';
+	chomp $param;
+	my $decoded = MIME::Base64::decode($param);
+	my @param = split(/\0/, $decoded);
+	return $fail if ($#param ne 2 || $param[1] eq '' || $param[2] eq '');
+	my ($user, $dom) = split(/\@/, $param[1]);
+	$dom =~ y/A-Z/a-z/;
+	if ($option{MyAuthDomain} eq $dom || $dom eq '') {
+	if ($authen->check($user, $param[2])) {
+		return $param[1];
+	}
+	}
+	return $fail;
+}
+
+=head1 NAME
+
+Submission - UTF8SMTP Submission daemon which supports downgrading
+
+=head1 DESCRIPTION
+
+Submission is an implimentation of draft-ietf-eai-smtp,
+draft-ietf-eai-utf8headers, draft-ietf-eai-downgrade.
+
+Submission supports SMTP AUTH (PLAIN only) and STARTTLS.
+Submission shares password database with Webmail client.
+
+If SMTP AUTH is enabled, all submission request needs authenticated by
+SMTP AUTH. But setting "RELAYCLIENT" environment value bypass SMTP AUTH.
+
+=head1 USAGE
+
+ Submission is invoked by inetd.
+
+ Put "submission stream tcp nowait nobody /Path-To-/Submission" to
+ inetd.conf.
+
+=head2 mail.conf
+
+ Write a configuration file and put it to "/Path-To-/mail.conf".
+
+ It contains colon sparated field name and field value.
+ The field name field is composed of the field name and the program name. 
+ Two fields are separated by '@'.
+ Program name sub field may be omitted.
+ Don't include useless spaces or comments.
+ The line starts with '#' character is treated as comment line.
+
+ The configuration file is shared with SMTPreceiver, Submission,
+ POP3d, mail.cgi.
+
+                                              (default value)
+   enable_eai:     responds UTF8SMTP or not   (0)
+   enable_8bit:    responds 8BITMIME or not   (0)
+   MaildirPath:    Maildir base directory     (.)
+   LogCategory:    syslog category            (daemon)
+   workdir:        Work directory (writable)  (.)
+   Myname:          EHLO name                 (localhost)
+   TimeZone:       Timezone used in Received  ()
+   TimeZoneOffset: Timezone offset            (0)
+   enable_startssl: Enable STARTSSL           (0)
+   enable_smtpauth: Enable SMTP AUTH PLAIN    (0)
+   Passwordfile:   Apache style passwd file   (none)
+   ssl_cert:       TLS Certificate file       (none)
+   ssl_key:        TLS Private Key file       (none)
+   MyAuthDomain:   Domainname used in SMTP AUTH (localhost)
+
+ Example:
+        enable_8bit: 1
+        enable_eai: 1
+        enable_smtpauth@Submission: 1
+	MaildirPath: /home/eai/maildirs
+        Passwordfile: /home/webmail/data/passwd
+	LogCategory: local0
+        ssl_cert@Submission: /home/eai/bin/cert.pem
+        ssl_key@Submission: /home/eai/bin/private.pem
+        TimeZone: +0900
+        TimeZoneOffset: 32400
+
+=head1 Bugs
+
+ This program may have many problems.
+ If you find any problem, please contact to the author.
+
+=head1 Author
+
+  Kazunori Fujiwara <fujiwara@jprs.co.jp> <fujiwara@wide.ad.jp>
+
+=head1 Copyright and License
+
+Copyright(c) 2007,2008 Japan Registry Services Co., Ltd.
+All rights reserved. By using this file, you agree to the
+terms and conditions set forth bellow.
+
+             LICENSE TERMS AND CONDITIONS 
+
+The following License Terms and Conditions apply, unless a different
+license is obtained from Japan Registry Service Co., Ltd. ("JPRS"),
+a Japanese corporation, Chiyoda First Bldg. East 13F,
+3-8-1 Nishi-Kanda, Chiyoda-ku, Tokyo 101-0065, Japan.
+
+1. Use, Modification and Redistribution (including distribution
+   of any modified or derived work) in source and/or binary forms
+   is permitted under this License Terms and Conditions.
+
+2. Redistribution of source code must retain the copyright notices
+   as they appear in each source code file, this License Terms and
+   Conditions.
+
+3. Redistribution in binary form must reproduce the Copyright
+   Notice, this License Terms and Conditions, in the documentation
+   and/or other materials provided with the distribution.
+   For the purposes of binary distribution the "Copyright Notice"
+   refers to the following language:
+   "Copyright(c) 2007,2008  Japan Registry Service Co., Ltd.
+    All rights reserved."
+
+4. The name of JPRS may not be used to endorse or promote products
+   derived from this Software without specific prior written
+   approval of JPRS.
+
+5. Disclaimer/Limitation of Liability: THIS SOFTWARE IS PROVIDED
+   BY JPRS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED.  IN NO EVENT SHALL JPRS BE LIABLE FOR ANY DIRECT,
+   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+   OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+   THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+   OF SUCH DAMAGES.
+
+=cut

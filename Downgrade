@@ -1,0 +1,257 @@
+#!/usr/bin/perl
+
+# Downgrade: UTF8SMTP Downgrading/displaying downgraded message
+#
+#    draft-ietf-eai-downgrade-06.txt
+#    draft-fujiwara-eai-downgraded-display-00.txt
+#
+# Author: Kazunori Fujiwara
+# Contact: <fujiwara@jprs.co.jp>, <fujiwara@wide.ad.jp>
+#
+# Copyright and License are at the end of this file. 
+# Documentation is avaiable by "perldoc"
+
+require 5.8.8;
+BEGIN {
+    use lib '/home/eai/lib';
+};
+use strict;
+use Getopt::Std;
+use UTF8SMTP::MIME;
+use UTF8SMTP::SMTP;
+use UTF8SMTP::Downgrading;
+
+my @error;
+
+my (%opts);
+##############################################################################
+sub do_folding_only
+{
+	my ($fh, $fhout, $fherr, $mode) = @_;
+	my ($input, $orig, $l);
+	my ($fh, $fhout) = @_;
+
+	&downgrading_init();
+	getheaderfromfile($fh, 2);
+	while(($orig = getheaderfromfile($fh, 0)) ne '') {
+		last if ($orig eq '');
+		$input = &unfolding($orig);
+		if ($mode) {
+			print $fhout &folding($input), "\n";
+		} else {
+			print $fhout $input, "\n";
+		}
+	}
+	print $fhout "\n";
+	while(<$fh>) {
+		print $fhout $_;
+	};
+	if ($#error ne 0) {
+		foreach my $l (@error) {
+			print $fherr "ERROR: ", $l, "\n";
+		}
+	}
+}
+###############################################################################
+#
+# Main
+#
+###############################################################################
+sub usage
+{
+print
+"$0 -[DE7T012FUs] [-m B|Q|A] [-f envelope_from] [-t envelope_to] [-d Number]
+	-D: Downgrade
+	-E: Downgrade with Envelope information (extended syntax)
+	-7: Downgrade with 7bit transport (without 8BITMIME)
+	-T: Test if it contains non_ascii character in header fields
+	-0: MIME decoding
+	-1: Displaying Technique 1
+	-2: Displaying technique 2
+	-F: Folding
+	-U: Unfolding
+	-m: Mime encode mode (B, Q, A) A=Auto
+	-6: Decode base64 encoded message or text 
+	-s: silent
+	-q: Supress envelope information
+	-d: debug level
+
+perldoc $0 shows a document of this program.
+";
+	exit 0;
+}
+getopts('6sqDE7T012FUNf:t:m:d:', \%opts);
+&main;
+sub main
+{
+	my $flag;
+	my $in;
+	my (@envelope, @downgraded);
+	my ($state, $body8bit, @message, $errorref);
+	my $option = 0;
+
+	if ($#ARGV >= 0 && -f $ARGV[0]) {
+		open($in, $ARGV[0]) || die "cannot open $ARGV[0]";
+	} else {
+		$in = *STDIN;
+	}
+	if ($opts{6}) {
+		$option |= &decoding_decode_base64;
+	}
+	if ($opts{N}) {
+		$option |= &decoding_nofolding;
+	}
+	if (defined($opts{m})) {
+		if ($opts{m} =~ /^[BQA]$/) {
+			&set_mime_encoding($opts{m});
+		} else {
+			&usage;
+		}
+	}
+	if ($opts{E}) {
+		while(<$in>) {
+			chomp;
+			next if (/^#/ || /^$/);
+			if (/^DATA(|[ \t]+.*)$/i) {
+				last;
+			} elsif (/^(Mail[ \t]+from|Rcpt[ \t]+To):[ \t]*([^ \t]+.*)$/i) {
+				my ($name, $value) = ($1, $2);
+				my $addr = &parse_mailfrom($value);
+				my ($e, $d) = &smtp_envelope_generate($name, $addr, 1);
+				push @downgraded, $d if ($d ne '');
+				push @envelope, $e;
+			} else {
+				print STDERR "UnknownCommand: $_\n";
+			} 
+		}
+	}
+	if (defined($opts{f})) {
+		my $addr = &parse_mailfrom($opts{f});
+		my ($e, $d) = &smtp_envelope_generate('Mail From', $addr, 1);
+		push @downgraded, $d if ($d ne '');
+		push @envelope, $e;
+	}
+	if (defined($opts{t})) {
+		my $addr = &parse_mailfrom($opts{t});
+		my ($e, $d) = &smtp_envelope_generate('Rcpt To', $addr, 1);
+		push @downgraded, $d if ($d ne '');
+		push @envelope, $e;
+	}
+	if ($opts{D}||$opts{E}||$opts{7}) {
+	    if (!$opts{q} && $#envelope >= 0) {
+		for my $l (@envelope) {
+		    print $l, "\n";
+		}
+		for my $l (@downgraded) {
+		    print $l;
+		}
+	    }
+	    ($state, $body8bit, $errorref, @message) =
+		&downgrading($in, $opts{7}?&downgrading_7bit:&downgrading_8bit);
+	} elsif ($opts{0}) {
+	    ($state, $errorref, @message) = &decoding_downgraded_message($in,&decoding_mime | $option);
+	} elsif ($opts{1}) {
+	    ($state, $errorref, @message) = &decoding_downgraded_message($in,&decoding_technique_1 | $option);
+	} elsif ($opts{2}) {
+	    ($state, $errorref, @message) = &decoding_downgraded_message($in,&decoding_technique_2 | $option);
+	} else {
+		&usage;
+	}
+	foreach my $l (@message) {
+		print $l;
+	}
+	foreach my $l (@$errorref) {
+		print "ERROR: $l\n";
+	}
+	exit 0;
+}
+
+=head1 NAME
+
+Downgrade - UTF8SMTP Downgrade/Downgraded Display
+
+=head1 DESCRIPTION
+
+ Downgrade is an implimentation of draft-ietf-eai-downgrade,
+ draft-ietf-eai-downgraded-display.
+
+=head1 USAGE
+
+    Downgrade -[DE7T012FUsN] [-m B|Q|A] [-f envelope_from] [-t envelope_to] [-d Number]
+
+	-D: Downgrade
+	-E: Downgrade with Envelope information (extended syntax)
+	-7: Downgrade with 7bit transport (without 8BITMIME)
+	-T: Test if it contains non_ascii character in header fields
+	-0: MIME decoding
+	-1: Displaying Technique 1
+	-2: Displaying technique 2
+	-F: Folding
+	-U: Unfolding
+	-N: No folding output
+	-m: Mime encode mode (B, Q, A) A=Auto
+	-s: silent
+	-q: Supress envelope information
+	-d: debug level
+
+ TBD
+
+=head1 Bugs
+
+ This program may have many problems.
+ If you find any problem, please contact to the author.
+
+ Non-ASCII check is achived by /[^000-177]/.
+
+=head1 Author
+
+  Kazunori Fujiwara <fujiwara@jprs.co.jp> <fujiwara@wide.ad.jp>
+
+=head1 Copyright and License
+
+Copyright(c) 2007,2008 Japan Registry Services Co., Ltd.
+All rights reserved. By using this file, you agree to the
+terms and conditions set forth bellow.
+
+             LICENSE TERMS AND CONDITIONS 
+
+The following License Terms and Conditions apply, unless a different
+license is obtained from Japan Registry Service Co., Ltd. ("JPRS"),
+a Japanese corporation, Chiyoda First Bldg. East 13F,
+3-8-1 Nishi-Kanda, Chiyoda-ku, Tokyo 101-0065, Japan.
+
+1. Use, Modification and Redistribution (including distribution
+   of any modified or derived work) in source and/or binary forms
+   is permitted under this License Terms and Conditions.
+
+2. Redistribution of source code must retain the copyright notices
+   as they appear in each source code file, this License Terms and
+   Conditions.
+
+3. Redistribution in binary form must reproduce the Copyright
+   Notice, this License Terms and Conditions, in the documentation
+   and/or other materials provided with the distribution.
+   For the purposes of binary distribution the "Copyright Notice"
+   refers to the following language:
+   "Copyright(c) 2007,2008  Japan Registry Service Co., Ltd.
+    All rights reserved."
+
+4. The name of JPRS may not be used to endorse or promote products
+   derived from this Software without specific prior written
+   approval of JPRS.
+
+5. Disclaimer/Limitation of Liability: THIS SOFTWARE IS PROVIDED
+   BY JPRS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED.  IN NO EVENT SHALL JPRS BE LIABLE FOR ANY DIRECT,
+   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+   OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+   THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+   OF SUCH DAMAGES.
+
+=cut
